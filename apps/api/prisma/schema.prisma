@@ -1,0 +1,628 @@
+// RukwaRide data model — spec §5, implemented exactly.
+// PostGIS is intentionally NOT used: proximity search lives in Redis GEO;
+// Postgres stores plain Decimal lat/lng.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PASSENGER
+  DRIVER
+  DISPATCHER
+  ADMIN
+}
+
+enum VehicleClass {
+  BODABODA
+  BAJAJI
+  CAR
+}
+
+enum DriverStatus {
+  OFFLINE
+  AVAILABLE
+  ON_OFFER
+  ON_TRIP
+}
+
+enum TripStatus {
+  SCHEDULED // booked for a future time; promoted to SEARCHING by a timer
+  REQUESTED
+  SEARCHING
+  OFFERED
+  ACCEPTED
+  ARRIVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED_BY_PASSENGER
+  CANCELLED_BY_DRIVER
+  EXPIRED
+  FAILED
+}
+
+enum TripSource {
+  PASSENGER_APP
+  DISPATCHER
+}
+
+// Ride (people) vs parcel courier (Bolt Send / Uber Connect style).
+enum TripKind {
+  RIDE
+  PARCEL
+}
+
+enum SosStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum PaymentMethod {
+  CASH
+  MOBILE_MONEY
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REFUNDED
+}
+
+enum LedgerAccount {
+  DRIVER_WALLET
+  PLATFORM_REVENUE
+  PLATFORM_RECEIVABLE
+  PASSENGER_ESCROW
+  AGGREGATOR_CLEARING
+}
+
+enum DocumentType {
+  NATIONAL_ID
+  DRIVING_LICENSE
+  LATRA_VEHICLE_LICENSE
+  INSURANCE
+  VEHICLE_PHOTO
+  DRIVER_PHOTO
+}
+
+enum DocumentStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  SOCKET
+}
+
+enum LatraReportStatus {
+  PENDING
+  SENT
+  ACKED
+  FAILED
+}
+
+model User {
+  id           String    @id @default(cuid())
+  phone        String    @unique // E.164
+  name         String
+  // Required by CeTS submitDriver (§4); optional for passengers.
+  email        String?
+  // National ID (NIN) — optional in CeTS submitTrip (§5). Personal data:
+  // collect only with consent, PDPC-relevant.
+  nida         String?
+  role         Role
+  passwordHash String? // admin/dispatcher only; passengers/drivers are OTP-only
+  language     String    @default("sw")
+  fcmToken     String?
+  isBlocked    Boolean   @default(false)
+  deletedAt    DateTime? // soft delete
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  driverProfile   DriverProfile?
+  tripsAsPassenger Trip[]        @relation("PassengerTrips")
+  tripsCreated     Trip[]        @relation("CreatedTrips")
+  savedPlaces      SavedPlace[]
+  ratingsGiven     Rating[]      @relation("RatingsGiven")
+  ratingsReceived  Rating[]      @relation("RatingsReceived")
+  notifications    Notification[]
+  supportTickets   SupportTicket[] @relation("TicketsOpened")
+  ticketsAssigned  SupportTicket[] @relation("TicketsAssigned")
+  documentsReviewed DriverDocument[] @relation("DocumentsReviewed")
+  landmarksVerified Landmark[]       @relation("LandmarksVerified")
+  sosAlertsRaised   SosAlert[]      @relation("SosRaised")
+  sosAlertsAcked    SosAlert[]      @relation("SosAcked")
+}
+
+model DriverProfile {
+  id                   String       @id @default(cuid())
+  userId               String       @unique
+  user                 User         @relation(fields: [userId], references: [id])
+  status               DriverStatus @default(OFFLINE)
+  currentVehicleId     String?      @unique
+  currentVehicle       Vehicle?     @relation("CurrentVehicle", fields: [currentVehicleId], references: [id])
+  ratingAvg            Decimal      @default(5.0) @db.Decimal(3, 2)
+  ratingCount          Int          @default(0)
+  // Denormalized cache of the ledger; reconciled nightly.
+  walletBalance        Decimal      @default(0) @db.Decimal(14, 0)
+  negativeBalanceLimit Decimal      @default(-15000) @db.Decimal(14, 0)
+  strikeCount          Int          @default(0)
+  // Standing consent for dispatcher FORCE-ACCEPT assignment (spec §7).
+  manualAssignConsent  Boolean      @default(false)
+  // Driving licence number — LATRA trip-report dataset requires it (§ Stage 2).
+  // CeTS requires a valid 10-digit number (docs/LATRA 1.pdf §5).
+  licenseNumber        String?
+  // Licence category (e.g. "D") — required by CeTS submitDriver (§4).
+  licenceCategory      String?
+  // CeTS driver registration state: a trip may only reference a driver that
+  // has been accepted by submitDriver first (§4 ordering constraint).
+  cetsRegisteredAt     DateTime?
+  cetsLastError        String?
+  // Hash of the last payload accepted by CeTS. LATRA requires re-submission
+  // "whenever driver details change"; comparing this beats hoping every edit
+  // path remembers to force a re-sync.
+  cetsFingerprint      String?
+  // Storage key of the approved driver photo; shown to the passenger (LATRA
+  // requires the rider to see the driver's name AND photo).
+  photoKey             String?
+  latraVerifiedAt      DateTime?
+  approvedAt           DateTime?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  vehicles  Vehicle[]        @relation("DriverVehicles")
+  documents DriverDocument[]
+  trips     Trip[]           @relation("DriverTrips")
+  ledger    LedgerEntry[]
+  payments  Payment[]        @relation("DriverPayments")
+  payouts   PayoutRequest[]
+}
+
+model Vehicle {
+  id                 String        @id @default(cuid())
+  driverId           String
+  driver             DriverProfile @relation("DriverVehicles", fields: [driverId], references: [id])
+  class              VehicleClass
+  plateNumber        String        @unique
+  make               String?
+  model              String?
+  color              String?
+  chassisNumber      String?
+  // Date the operator registered the vehicle — CeTS submitVehicle requires it.
+  registrationDate   DateTime?
+  latraLicenseNumber String?
+  latraVerified      Boolean       @default(false)
+  // CeTS vehicle registration state (§3 ordering constraint).
+  cetsRegisteredAt   DateTime?
+  cetsLastError      String?
+  /** Hash of the last payload CeTS accepted — see DriverProfile.cetsFingerprint. */
+  cetsFingerprint    String?
+  active             Boolean       @default(true)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  currentForDriver DriverProfile? @relation("CurrentVehicle")
+  trips            Trip[]
+}
+
+model DriverDocument {
+  id              String         @id @default(cuid())
+  driverId        String
+  driver          DriverProfile  @relation(fields: [driverId], references: [id])
+  type            DocumentType
+  status          DocumentStatus @default(PENDING_REVIEW)
+  fileUrl         String
+  expiresAt       DateTime?
+  reviewedById    String?
+  reviewedBy      User?          @relation("DocumentsReviewed", fields: [reviewedById], references: [id])
+  rejectionReason String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([driverId, type])
+}
+
+model Trip {
+  id                 String        @id @default(cuid())
+  passengerId        String?
+  passenger          User?         @relation("PassengerTrips", fields: [passengerId], references: [id])
+  createdById        String
+  createdBy          User          @relation("CreatedTrips", fields: [createdById], references: [id])
+  source             TripSource
+  status             TripStatus    @default(REQUESTED)
+  kind               TripKind      @default(RIDE)
+  vehicleClass       VehicleClass
+  contactPhone       String? // dispatcher-created trips for callers without accounts
+  // Caller's name for a dispatcher-created trip (no passenger account). Feeds
+  // CeTS's required passengerName so we don't report a placeholder to LATRA.
+  contactName        String?
+  // Parcel courier fields (kind = PARCEL): who receives the package at the drop.
+  recipientName      String?
+  recipientPhone     String?
+  packageNote        String?
+  // Scheduled rides: when set and in the future, the trip waits in SCHEDULED
+  // until a timer promotes it to SEARCHING.
+  scheduledAt        DateTime?
+  // Public share-my-trip link (Bolt-style): opaque token, no auth needed to view.
+  shareToken         String?       @unique
+  pickupLat          Decimal       @db.Decimal(9, 6)
+  pickupLng          Decimal       @db.Decimal(9, 6)
+  pickupLandmarkId   String?
+  pickupLandmark     Landmark?     @relation("PickupLandmark", fields: [pickupLandmarkId], references: [id])
+  pickupNote         String?
+  dropLat            Decimal       @db.Decimal(9, 6)
+  dropLng            Decimal       @db.Decimal(9, 6)
+  dropLandmarkId     String?
+  dropLandmark       Landmark?     @relation("DropLandmark", fields: [dropLandmarkId], references: [id])
+  estimatedDistanceM Int
+  estimatedDurationS Int
+  estimatedFare      Decimal       @db.Decimal(14, 0)
+  finalDistanceM     Int?
+  finalDurationS     Int?
+  finalFare          Decimal?      @db.Decimal(14, 0)
+  fareBreakdown      Json?
+  paymentMethod      PaymentMethod @default(CASH)
+  driverId           String?
+  driver             DriverProfile? @relation("DriverTrips", fields: [driverId], references: [id])
+  vehicleId          String?
+  vehicle            Vehicle?      @relation(fields: [vehicleId], references: [id])
+  offeredDriverIds   String[]      @default([])
+  // Current outstanding offer (guards stale accept/decline)
+  offerSeq           Int           @default(0)
+  offeredDriverId    String?
+  searchStartedAt    DateTime?
+  acceptedAt         DateTime?
+  arrivedAt          DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?
+  cancellationFee    Decimal?      @db.Decimal(14, 0)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  statusHistory  TripStatusEvent[]
+  locationPoints TripLocationPoint[]
+  payments       Payment[]
+  ledgerEntries  LedgerEntry[]
+  ratings        Rating[]
+  latraReports   LatraReport[]
+  supportTickets SupportTicket[]
+  sosAlerts      SosAlert[]
+
+  @@index([status])
+  @@index([passengerId, status])
+  @@index([driverId, status])
+  @@index([status, scheduledAt])
+}
+
+// Emergency alert raised by a passenger or driver during an active trip
+// (Bolt/Uber SOS). Surfaced on the dispatcher console for a welfare response.
+model SosAlert {
+  id                String    @id @default(cuid())
+  tripId            String
+  trip              Trip      @relation(fields: [tripId], references: [id])
+  raisedById        String
+  raisedBy          User      @relation("SosRaised", fields: [raisedById], references: [id])
+  raisedByRole      Role
+  lat               Decimal?  @db.Decimal(9, 6)
+  lng               Decimal?  @db.Decimal(9, 6)
+  note              String?
+  status            SosStatus @default(OPEN)
+  acknowledgedById  String?
+  acknowledgedBy    User?     @relation("SosAcked", fields: [acknowledgedById], references: [id])
+  acknowledgedAt    DateTime?
+  resolvedAt        DateTime?
+  resolutionNote    String?
+  createdAt         DateTime  @default(now())
+
+  @@index([status, createdAt])
+}
+
+model TripStatusEvent {
+  id         String     @id @default(cuid())
+  tripId     String
+  trip       Trip       @relation(fields: [tripId], references: [id])
+  fromStatus TripStatus?
+  toStatus   TripStatus
+  actorId    String?
+  at         DateTime   @default(now())
+  meta       Json?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  @@index([tripId, at])
+}
+
+model TripLocationPoint {
+  id         String   @id @default(cuid())
+  tripId     String
+  trip       Trip     @relation(fields: [tripId], references: [id])
+  lat        Decimal  @db.Decimal(9, 6)
+  lng        Decimal  @db.Decimal(9, 6)
+  recordedAt DateTime
+  source     String   @default("DRIVER_GPS")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([tripId, recordedAt])
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  tripId          String?
+  trip            Trip?         @relation(fields: [tripId], references: [id])
+  // Wallet top-ups and payouts belong to a driver, not a trip.
+  driverId        String?
+  driver          DriverProfile? @relation("DriverPayments", fields: [driverId], references: [id])
+  walletTopUp     Boolean       @default(false)
+  method          PaymentMethod
+  status          PaymentStatus @default(PENDING)
+  amount          Decimal       @db.Decimal(14, 0)
+  currency        String        @default("TZS")
+  providerRef     String?       @unique
+  providerPayload Json?
+  idempotencyKey  String        @unique
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  ledgerEntries LedgerEntry[]
+  payoutRequest PayoutRequest?
+}
+
+enum PayoutStatus {
+  REQUESTED
+  APPROVED
+  PAID
+  REJECTED
+  FAILED
+}
+
+// Spec §9: payouts are rare (drivers keep cash fares) and always
+// admin-approved — never automatic.
+model PayoutRequest {
+  id           String        @id @default(cuid())
+  driverId     String
+  driver       DriverProfile @relation(fields: [driverId], references: [id])
+  amount       Decimal       @db.Decimal(14, 0)
+  status       PayoutStatus  @default(REQUESTED)
+  approvedById String?
+  rejectReason String?
+  paymentId    String?       @unique
+  payment      Payment?      @relation(fields: [paymentId], references: [id])
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([driverId, status])
+}
+
+model LedgerEntry {
+  id        String        @id @default(cuid())
+  txnId     String // groups a balanced transaction; entries per txnId sum to zero
+  account   LedgerAccount
+  driverId  String?
+  driver    DriverProfile? @relation(fields: [driverId], references: [id])
+  debit     Decimal       @default(0) @db.Decimal(14, 0)
+  credit    Decimal       @default(0) @db.Decimal(14, 0)
+  tripId    String?
+  trip      Trip?         @relation(fields: [tripId], references: [id])
+  paymentId String?
+  payment   Payment?      @relation(fields: [paymentId], references: [id])
+  memo      String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@index([txnId])
+  @@index([driverId, account])
+}
+
+model FareConfig {
+  id            String       @id @default(cuid())
+  vehicleClass  VehicleClass
+  active        Boolean      @default(true)
+  baseFare      Decimal      @db.Decimal(14, 0)
+  perKm         Decimal      @db.Decimal(14, 0)
+  perMin        Decimal      @db.Decimal(14, 0)
+  bookingFeePct Decimal      @db.Decimal(5, 2)
+  minimumFare   Decimal      @db.Decimal(14, 0)
+  commissionPct Decimal      @db.Decimal(5, 2)
+  currency      String       @default("TZS")
+  effectiveFrom DateTime     @default(now())
+  latraOrderRef String // which LATRA notice these values comply with
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  // Single-active-config-per-class is enforced in FaresService (a partial
+  // unique index WHERE active is added by raw SQL in the migration).
+  @@index([vehicleClass, active])
+}
+
+model LatraBounds {
+  id            String       @id @default(cuid())
+  vehicleClass  VehicleClass @unique
+  minFareFloor  Decimal      @db.Decimal(14, 0)
+  perKmMin      Decimal      @db.Decimal(14, 0)
+  perKmMax      Decimal      @db.Decimal(14, 0)
+  perMinMin     Decimal      @db.Decimal(14, 0)
+  perMinMax     Decimal      @db.Decimal(14, 0)
+  commissionMax Decimal      @db.Decimal(5, 2)
+  bookingFeeMax Decimal      @db.Decimal(5, 2)
+  sourceRef     String
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+model Landmark {
+  id         String   @id @default(cuid())
+  name       String // Swahili primary name
+  aliasNames String[] @default([])
+  lat        Decimal  @db.Decimal(9, 6)
+  lng        Decimal  @db.Decimal(9, 6)
+  category   String   @default("other") // market, hospital, school, stand, office, other
+  // "OSM" = crowd-sourced import, replaceable on re-seed.
+  // "STAFF" = created or corrected in the admin editor; NEVER overwritten by a
+  // re-import (the demo re-seeds on every launch, which would otherwise erase
+  // every local correction).
+  source     String   @default("OSM")
+  // A human confirmed this place exists, is correctly named and correctly
+  // positioned. Search ranks verified places first, so it must mean something.
+  verified   Boolean  @default(false)
+  verifiedAt DateTime?
+  verifiedById String?
+  verifiedBy   User?   @relation("LandmarksVerified", fields: [verifiedById], references: [id])
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  pickupTrips Trip[] @relation("PickupLandmark")
+  dropTrips   Trip[] @relation("DropLandmark")
+
+  @@index([name])
+}
+
+model SavedPlace {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  label     String
+  lat       Decimal  @db.Decimal(9, 6)
+  lng       Decimal  @db.Decimal(9, 6)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model Rating {
+  id        String   @id @default(cuid())
+  tripId    String
+  trip      Trip     @relation(fields: [tripId], references: [id])
+  raterId   String
+  rater     User     @relation("RatingsGiven", fields: [raterId], references: [id])
+  rateeId   String
+  ratee     User     @relation("RatingsReceived", fields: [rateeId], references: [id])
+  score     Int // 1–5
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tripId, raterId])
+}
+
+model SupportTicket {
+  id             String   @id @default(cuid())
+  openedById     String
+  openedBy       User     @relation("TicketsOpened", fields: [openedById], references: [id])
+  tripId         String?
+  trip           Trip?    @relation(fields: [tripId], references: [id])
+  category       String
+  body           String
+  status         String   @default("OPEN")
+  assignedToId   String?
+  assignedTo     User?    @relation("TicketsAssigned", fields: [assignedToId], references: [id])
+  resolutionNote String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Notification {
+  id          String              @id @default(cuid())
+  userId      String
+  user        User                @relation(fields: [userId], references: [id])
+  channel     NotificationChannel
+  templateKey String
+  payload     Json
+  sentAt      DateTime?
+  failedAt    DateTime?
+  error       String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+// Spec §10: notification templates live in the DB (sw/en), not code.
+model NotificationTemplate {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  sw        String
+  en        String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  action    String
+  entity    String
+  entityId  String
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([entity, entityId])
+}
+
+model OtpCode {
+  id         String    @id @default(cuid())
+  phone      String
+  codeHash   String
+  purpose    String    @default("LOGIN")
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([phone, purpose])
+}
+
+/**
+ * CeTS §6 requires ONE operational summary per day. Persisted so we can show
+ * which days were actually filed and retry the ones that were not — a
+ * fire-and-forget job leaves no evidence for a regulator, and a permanently
+ * failing submission would otherwise be silent.
+ */
+model LatraDailyReport {
+  id              String            @id @default(cuid())
+  /** Report date in EAT, "YYYY-MM-DD". One row per day. */
+  reportDate      String            @unique
+  totalTrip       Int
+  totalPaidAmount Int
+  status          LatraReportStatus @default(PENDING)
+  attempts        Int               @default(0)
+  lastError       String?
+  submittedAt     DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([status])
+}
+
+model LatraReport {
+  id        String            @id @default(cuid())
+  tripId    String
+  trip      Trip              @relation(fields: [tripId], references: [id])
+  payload   Json
+  status    LatraReportStatus @default(PENDING)
+  attempts  Int               @default(0)
+  lastError String?
+  // Official confirmation the trip was recorded in CeTS (§5 response data).
+  latraReferenceNumber String?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@index([status])
+}

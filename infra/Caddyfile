@@ -1,0 +1,15 @@
+# TLS + reverse proxy (spec §17). {$DOMAIN} comes from the compose env.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy web:3000
+}
+
+api.{$DOMAIN} {
+	encode gzip
+
+	# Metrics stay internal — Prometheus scrapes over the docker network.
+	@metrics path /metrics
+	respond @metrics 403
+
+	reverse_proxy api:3001
+}

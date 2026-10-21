@@ -1,0 +1,21 @@
+# Demo reverse proxy: serves the web app and the API on ONE origin so the
+# Cloudflare Tunnel needs only a single hostname. Same-origin means no CORS and
+# the refresh cookie just works. API top-level paths + Socket.io go to the API;
+# everything else (pages, /_next, icons) goes to the web app.
+#
+# Run with host networking so it can reach the API/web on localhost:
+#   docker run -d --name rukwaride-caddy --network host \
+#     -v $PWD/infra/caddy-demo/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2-alpine
+:8080 {
+	# NOTE: every new API controller must be listed here, or its route 404s
+	# into the Next.js app and the feature silently breaks.
+	# /.well-known/* is how LATRA's CeTS fetches our JWKS to verify the
+	# self-signed JWT — if it lands on the web app, integration cannot work.
+	@api path /auth/* /trips /trips/* /drivers/* /users/* /landmarks /landmarks/* /payments/* /admin/* /dispatch/* /support/* /routing/* /public/* /.well-known/* /health /metrics /socket.io/*
+	handle @api {
+		reverse_proxy 127.0.0.1:3001
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}

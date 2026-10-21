@@ -1,0 +1,139 @@
+# RukwaRide production — single 8 GB / 4 vCPU VPS (spec §15/§17).
+# Usage:  docker compose -f infra/docker-compose.prod.yml --env-file .env.prod up -d
+# The explicit project name isolates this stack from the dev compose
+# (infra/docker-compose.yml): both files live in infra/, so without it they
+# default to the same "infra" project and clobber each other's containers/volumes.
+# Optional profiles:  --profile routing (OSRM)   --profile monitoring (Prometheus+Grafana)
+name: rukwaride-prod
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env.prod}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+
+  api:
+    image: ${REGISTRY:-ghcr.io/example}/rukwaride-api:${TAG:-latest}
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file: ../.env.prod
+    environment:
+      DATABASE_URL: postgresql://rukwaride:${POSTGRES_PASSWORD}@postgres:5432/rukwaride
+      REDIS_URL: redis://redis:6379
+      OSRM_URL: ${OSRM_URL:-http://osrm:5000}
+      WEB_ORIGINS: https://${DOMAIN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    image: ${REGISTRY:-ghcr.io/example}/rukwaride-web:${TAG:-latest}
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: https://api.${DOMAIN:-example.co.tz}
+        NEXT_PUBLIC_TILE_URL: ${TILE_URL:-https://tile.openstreetmap.org/{z}/{x}/{y}.png}
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rukwaride
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.prod}
+      POSTGRES_DB: rukwaride
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rukwaride"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    # Redis is rebuildable (spec §15): no persistence needed; keep it fast.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Nightly pg_dump, 30-day retention (spec §15). Sync the backups volume to
+  # object storage with rclone (see docs/RUNBOOK.md#backups).
+  backup:
+    image: prodrigestivill/postgres-backup-local:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: rukwaride
+      POSTGRES_USER: rukwaride
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: "30"
+      BACKUP_KEEP_WEEKS: "0"
+      BACKUP_KEEP_MONTHS: "0"
+    volumes:
+      - pgbackups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Self-hosted routing (spec §11). Prepare data first: infra/osrm/setup.sh
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:latest
+    profiles: ["routing"]
+    restart: unless-stopped
+    command: osrm-routed --algorithm mld /data/rukwa.osrm
+    volumes:
+      - ./osrm/data:/data:ro
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    volumes:
+      - kuma_data:/app/data
+
+volumes:
+  pgdata:
+  pgbackups:
+  caddy_data:
+  caddy_config:
+  prom_data:
+  grafana_data:
+  kuma_data:

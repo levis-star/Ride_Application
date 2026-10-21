@@ -1,0 +1,29 @@
+{
+  "name": "@rukwaride/scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "sim": "tsx sim-drivers.ts",
+    "test": "vitest run --config vitest.config.ts",
+    "e2e": "playwright test",
+    "load-test": "tsx load-test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.2.1",
+    "@rukwaride/shared": "workspace:*",
+    "dotenv": "^16.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.10.5",
+    "ioredis": "^5.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
