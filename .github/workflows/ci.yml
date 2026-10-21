@@ -34,9 +34,10 @@ jobs:
       OTP_PEPPER: ci-pepper
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here — pnpm/action-setup reads `packageManager` from
+      # package.json. Specifying both makes the action fail with
+      # "Multiple versions of pnpm specified".
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 22
